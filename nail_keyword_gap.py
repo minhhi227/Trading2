@@ -25,10 +25,10 @@ Caveats:
 """
 
 import argparse
+import csv
 import json
-import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import requests
@@ -63,13 +63,26 @@ DEFAULT_KEYWORDS: List[str] = [
     "nail salon open sunday",
 ]
 
+# Toledo, OH and surrounding-area towns, handy for --locations.
+TOLEDO_AREA: List[str] = [
+    "Toledo OH",
+    "Sylvania OH",
+    "Maumee OH",
+    "Perrysburg OH",
+    "Oregon OH",
+    "Holland OH",
+    "Rossford OH",
+    "Waterville OH",
+]
+
 
 @dataclass
 class KeywordResult:
     keyword: str
     found: bool
+    location: str = ""
     rank: Optional[int] = None       # 1-based position if found
-    competitors: Optional[List[str]] = None   # top names seen for context
+    competitors: List[str] = field(default_factory=list)  # top names for context
     error: Optional[str] = None
 
 
@@ -91,7 +104,9 @@ def analyze_keyword(
     try:
         places = search_google_maps(query, limit=limit, timeout=timeout)
     except (requests.RequestException, ValueError) as exc:
-        return KeywordResult(keyword=keyword, found=False, error=str(exc))
+        return KeywordResult(
+            keyword=keyword, found=False, location=location, error=str(exc)
+        )
 
     rank = None
     for i, place in enumerate(places, 1):
@@ -103,6 +118,7 @@ def analyze_keyword(
     return KeywordResult(
         keyword=keyword,
         found=rank is not None,
+        location=location,
         rank=rank,
         competitors=top_names,
     )
@@ -132,6 +148,27 @@ def run_gap_analysis(
     return results
 
 
+def write_csv(path: str, business: str, results: List[KeywordResult]) -> None:
+    """Write all results to a CSV ready for a spreadsheet / Google Ads import."""
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            ["business", "location", "keyword", "status", "rank", "top_competitors"]
+        )
+        for r in results:
+            status = "ERROR" if r.error else ("FOUND" if r.found else "MISSING")
+            writer.writerow(
+                [
+                    business,
+                    r.location,
+                    r.keyword,
+                    status,
+                    r.rank if r.rank else "",
+                    "; ".join(r.competitors) if r.competitors else (r.error or ""),
+                ]
+            )
+
+
 def _print_report(business: str, location: str, results: List[KeywordResult]) -> None:
     errors = [r for r in results if r.error]
     missing = [r for r in results if not r.error and not r.found]
@@ -142,15 +179,17 @@ def _print_report(business: str, location: str, results: List[KeywordResult]) ->
     print(f"\n❌ MISSING — target with Google Ads ({len(missing)}):")
     if missing:
         for r in missing:
+            loc = f" [{r.location}]" if r.location else ""
             comp = f"   (top: {', '.join(r.competitors)})" if r.competitors else ""
-            print(f"   • {r.keyword}{comp}")
+            print(f"   • {r.keyword}{loc}{comp}")
     else:
         print("   (none — appeared for every keyword)")
 
     print(f"\n✅ FOUND — already ranking ({len(found)}):")
     if found:
         for r in sorted(found, key=lambda x: x.rank or 999):
-            print(f"   • {r.keyword} (rank #{r.rank})")
+            loc = f" [{r.location}]" if r.location else ""
+            print(f"   • {r.keyword}{loc} (rank #{r.rank})")
     else:
         print("   (none)")
 
@@ -169,7 +208,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         description="Find Google Maps keywords a business does NOT rank for."
     )
     parser.add_argument("business", help="Business name, e.g. 'Queen Nail'")
-    parser.add_argument("location", help="City/area, e.g. 'Houston TX'")
+    parser.add_argument(
+        "location",
+        help="City/area, e.g. 'Toledo OH'. Use a comma to check several towns: "
+        "'Toledo OH,Sylvania OH'. Pass 'toledo-area' for the built-in list.",
+    )
     parser.add_argument(
         "--keywords",
         help="Comma-separated keywords to check (default: built-in nail list)",
@@ -184,6 +227,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Seconds to wait between searches (default: 2.0)",
     )
     parser.add_argument("--json", action="store_true", help="Output JSON")
+    parser.add_argument("--csv", help="Write results to this CSV file path")
     args = parser.parse_args(argv)
 
     keywords = (
@@ -192,19 +236,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         else None
     )
 
-    results = run_gap_analysis(
-        args.business,
-        args.location,
-        keywords=keywords,
-        limit=args.limit,
-        timeout=args.timeout,
-        delay=args.delay,
-    )
+    if args.location.strip().lower() == "toledo-area":
+        locations = TOLEDO_AREA
+    else:
+        locations = [loc.strip() for loc in args.location.split(",") if loc.strip()]
+
+    all_results: List[KeywordResult] = []
+    for loc in locations:
+        all_results.extend(
+            run_gap_analysis(
+                args.business,
+                loc,
+                keywords=keywords,
+                limit=args.limit,
+                timeout=args.timeout,
+                delay=args.delay,
+            )
+        )
 
     if args.json:
-        print(json.dumps([r.__dict__ for r in results], indent=2, ensure_ascii=False))
+        print(json.dumps([r.__dict__ for r in all_results], indent=2, ensure_ascii=False))
     else:
-        _print_report(args.business, args.location, results)
+        _print_report(args.business, ", ".join(locations), all_results)
+
+    if args.csv:
+        write_csv(args.csv, args.business, all_results)
+        print(f"\n📄 Wrote {len(all_results)} rows to {args.csv}")
     return 0
 
 
