@@ -76,13 +76,22 @@ TOLEDO_AREA: List[str] = [
 ]
 
 
+# Review-count thresholds used to judge how entrenched the ranking
+# competitors are. Few reviews -> easy to outrank -> high-value keyword.
+WEAK_MAX_REVIEWS = 50
+MEDIUM_MAX_REVIEWS = 200
+
+
 @dataclass
 class KeywordResult:
     keyword: str
     found: bool
     location: str = ""
     rank: Optional[int] = None       # 1-based position if found
-    competitors: List[str] = field(default_factory=list)  # top names for context
+    competitors: List[dict] = field(default_factory=list)  # name/rating/reviews
+    competition: str = "UNKNOWN"     # WEAK / MEDIUM / STRONG / UNKNOWN
+    top_reviews: Optional[int] = None   # reviews of the strongest competitor
+    priority: str = "-"              # HIGH / MEDIUM / LOW for MISSING keywords
     error: Optional[str] = None
 
 
@@ -91,6 +100,47 @@ def _name_matches(target: str, candidate: str) -> bool:
     t = target.lower().strip()
     c = (candidate or "").lower().strip()
     return bool(c) and (t in c or c in t)
+
+
+def _assess_competition(places, exclude_name: str):
+    """Judge how strong the ranking competitors are.
+
+    Returns (level, top_reviews, competitor_dicts). The "bar to clear" is the
+    highest review count among the top results, since that is the entrenched
+    rival you would need to outrank. The target business itself is excluded.
+    """
+    competitors = []
+    for p in places[:5]:
+        if not p.name or _name_matches(exclude_name, p.name):
+            continue
+        competitors.append(
+            {"name": p.name, "rating": p.rating, "reviews": p.reviews}
+        )
+
+    review_counts = [c["reviews"] for c in competitors[:3] if c["reviews"]]
+    if not review_counts:
+        return "UNKNOWN", None, competitors[:3]
+
+    top_reviews = max(review_counts)
+    if top_reviews < WEAK_MAX_REVIEWS:
+        level = "WEAK"
+    elif top_reviews < MEDIUM_MAX_REVIEWS:
+        level = "MEDIUM"
+    else:
+        level = "STRONG"
+    return level, top_reviews, competitors[:3]
+
+
+def _priority_for(found: bool, competition: str) -> str:
+    """Map (missing?, competition strength) to an action priority."""
+    if found:
+        return "-"  # already ranking, no ad needed for visibility
+    return {
+        "WEAK": "HIGH",      # not ranking + weak rivals = best opportunity
+        "MEDIUM": "MEDIUM",
+        "STRONG": "LOW",     # not ranking + entrenched rivals = hard/costly
+        "UNKNOWN": "MEDIUM",
+    }.get(competition, "MEDIUM")
 
 
 def analyze_keyword(
@@ -114,13 +164,17 @@ def analyze_keyword(
             rank = i
             break
 
-    top_names = [p.name for p in places[:3] if p.name]
+    found = rank is not None
+    competition, top_reviews, competitors = _assess_competition(places, business)
     return KeywordResult(
         keyword=keyword,
-        found=rank is not None,
+        found=found,
         location=location,
         rank=rank,
-        competitors=top_names,
+        competitors=competitors,
+        competition=competition,
+        top_reviews=top_reviews,
+        priority=_priority_for(found, competition),
     )
 
 
@@ -153,10 +207,15 @@ def write_csv(path: str, business: str, results: List[KeywordResult]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(
-            ["business", "location", "keyword", "status", "rank", "top_competitors"]
+            [
+                "business", "location", "keyword", "status", "rank",
+                "priority", "competition", "top_competitor_reviews",
+                "top_competitors",
+            ]
         )
         for r in results:
             status = "ERROR" if r.error else ("FOUND" if r.found else "MISSING")
+            comp_str = "; ".join(_fmt_competitor(c) for c in r.competitors)
             writer.writerow(
                 [
                     business,
@@ -164,9 +223,27 @@ def write_csv(path: str, business: str, results: List[KeywordResult]) -> None:
                     r.keyword,
                     status,
                     r.rank if r.rank else "",
-                    "; ".join(r.competitors) if r.competitors else (r.error or ""),
+                    r.priority,
+                    r.competition,
+                    r.top_reviews if r.top_reviews is not None else "",
+                    comp_str if comp_str else (r.error or ""),
                 ]
             )
+
+
+def _fmt_competitor(c: dict) -> str:
+    """Render one competitor as 'Name (4.5★, 120 reviews)'."""
+    bits = []
+    if c.get("rating") is not None:
+        bits.append(f"{c['rating']}★")
+    if c.get("reviews") is not None:
+        bits.append(f"{c['reviews']} reviews")
+    suffix = f" ({', '.join(bits)})" if bits else ""
+    return f"{c.get('name', '?')}{suffix}"
+
+
+# Sort order so the best opportunities float to the top of the report.
+_PRIORITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "-": 3}
 
 
 def _print_report(business: str, location: str, results: List[KeywordResult]) -> None:
@@ -177,11 +254,22 @@ def _print_report(business: str, location: str, results: List[KeywordResult]) ->
     print(f"\nGap analysis for '{business}' in {location}\n" + "=" * 50)
 
     print(f"\n❌ MISSING — target with Google Ads ({len(missing)}):")
+    print("   (sorted by opportunity: HIGH = not ranking against weak rivals)")
     if missing:
+        missing.sort(key=lambda r: _PRIORITY_ORDER.get(r.priority, 9))
         for r in missing:
             loc = f" [{r.location}]" if r.location else ""
-            comp = f"   (top: {', '.join(r.competitors)})" if r.competitors else ""
-            print(f"   • {r.keyword}{loc}{comp}")
+            bar = (
+                f"top rival {r.top_reviews} reviews"
+                if r.top_reviews is not None
+                else "no rival data"
+            )
+            print(
+                f"   • [{r.priority:<6}] {r.keyword}{loc}"
+                f"  — {r.competition} competition ({bar})"
+            )
+            if r.competitors:
+                print(f"        rivals: {', '.join(_fmt_competitor(c) for c in r.competitors)}")
     else:
         print("   (none — appeared for every keyword)")
 
