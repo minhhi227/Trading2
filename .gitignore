@@ -8,3 +8,7 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# Generated keyword-gap output (real & sample CSVs are not source)
+queen_nail*.csv
+*_SAMPLE.csv
