@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# Progress file written by tools/heic_to_jpg_drive.py
+converted.json
+
+.ipynb_checkpoints/
